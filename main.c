@@ -2,11 +2,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp_var.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,8 +50,9 @@ static int open_probe_socket(int ttl, in_port_t source_port);
 static int start_conn(int tcp, const struct sockaddr_in *remote);
 
 static struct sockaddr_in local_address(int tcp);
-static int                match_icmp(const unsigned char *p, size_t n, const struct sockaddr_in *local, const struct sockaddr_in *remote, unsigned *code);
-static bool               receive_icmp(int icmp, const struct sockaddr_in *local, const struct sockaddr_in *remote, reply_t *reply);
+static bool               initial_sequence(const struct sockaddr_in *local, const struct sockaddr_in *remote, uint32_t *sequence);
+static int                match_icmp(const unsigned char *p, size_t n, const struct sockaddr_in *local, const struct sockaddr_in *remote, uint32_t sequence, unsigned *code);
+static bool               receive_icmp(int icmp, const struct sockaddr_in *local, const struct sockaddr_in *remote, uint32_t sequence, reply_t *reply);
 static reply_t            wait_for_reply(int icmp, int tcp, const struct sockaddr_in *remote, double start, int initial_error);
 
 static reply_t            probe(int icmp, const struct sockaddr_in *remote, int ttl, in_port_t *source_port);
@@ -119,7 +122,57 @@ static struct sockaddr_in local_address(int tcp) {
     return address;
 }
 
-static int match_icmp(const unsigned char *p, size_t n, const struct sockaddr_in *local, const struct sockaddr_in *remote, unsigned *code) {
+static bool initial_sequence(const struct sockaddr_in *local, const struct sockaddr_in *remote, uint32_t *sequence) {
+    // macOS's TCP_CONNECTION_INFO does not expose sequence numbers. The exported
+    // TCP control block includes the SYN's initial sequence number (iss).
+    unsigned char *data;
+    size_t         size;
+    for (;;) {
+        size = 0;
+        if (sysctlbyname("net.inet.tcp.pcblist64", NULL, &size, NULL, 0) < 0) {
+            die("error: sysctl: could not size TCP connection table");
+        }
+        data = malloc(size);
+        if (!data) {
+            die("error: malloc: could not allocate TCP connection table");
+        }
+        if (sysctlbyname("net.inet.tcp.pcblist64", data, &size, NULL, 0) == 0) {
+            break;
+        }
+        int error = errno;
+        free(data);
+        if (error != ENOMEM) {
+            errno = error;
+            die("error: sysctl: could not read TCP connection table");
+        }
+        // Connections can be added between the size query and the snapshot.
+    }
+
+    bool found = false;
+    for (size_t offset = 0; size - offset >= sizeof(uint32_t);) {
+        uint32_t length;
+        memcpy(&length, data + offset, sizeof length);
+        if (length < sizeof length || length > size - offset) {
+            break;
+        }
+        if (length == sizeof(struct xtcpcb64)) {
+            struct xtcpcb64 entry;
+            memcpy(&entry, data + offset, sizeof entry);
+            const struct xinpcb64 *inp = &entry.xt_inpcb;
+            if ((inp->inp_vflag & INP_IPV4) && inp->inp_laddr.s_addr == local->sin_addr.s_addr &&
+                inp->inp_faddr.s_addr == remote->sin_addr.s_addr && inp->inp_lport == local->sin_port && inp->inp_fport == remote->sin_port) {
+                *sequence = htonl(entry.iss);
+                found     = true;
+                break;
+            }
+        }
+        offset += length;
+    }
+    free(data);
+    return found;
+}
+
+static int match_icmp(const unsigned char *p, size_t n, const struct sockaddr_in *local, const struct sockaddr_in *remote, uint32_t sequence, unsigned *code) {
     if (n < 20 || (p[0] >> 4) != 4 || p[9] != IPPROTO_ICMP) {
         return 0;
     }
@@ -144,14 +197,14 @@ static int match_icmp(const unsigned char *p, size_t n, const struct sockaddr_in
     const unsigned char *tcp = ip + inner;
 
     if (memcmp(ip + 12, &local->sin_addr, 4) || memcmp(ip + 16, &remote->sin_addr, 4) || memcmp(tcp, &local->sin_port, 2) ||
-        memcmp(tcp + 2, &remote->sin_port, 2)) {
+        memcmp(tcp + 2, &remote->sin_port, 2) || memcmp(tcp + 4, &sequence, sizeof sequence)) {
         return 0;
     }
     *code = icmp[1];
     return icmp[0] == 11 ? 1 : 2;
 }
 
-static bool receive_icmp(int icmp, const struct sockaddr_in *local, const struct sockaddr_in *remote, reply_t *reply) {
+static bool receive_icmp(int icmp, const struct sockaddr_in *local, const struct sockaddr_in *remote, uint32_t sequence, reply_t *reply) {
     unsigned char      packet[1u << 16];
     struct sockaddr_in sender;
     socklen_t          size = (sizeof sender);
@@ -165,7 +218,7 @@ static bool receive_icmp(int icmp, const struct sockaddr_in *local, const struct
     }
 
     unsigned code;
-    int      kind = match_icmp(packet, (size_t)n, local, remote, &code);
+    int      kind = match_icmp(packet, (size_t)n, local, remote, sequence, &code);
     if (!kind) {
         return false;
     }
@@ -187,13 +240,17 @@ static reply_t wait_for_reply(int icmp, int tcp, const struct sockaddr_in *remot
     } else {
         struct sockaddr_in local       = local_address(tcp);
         int                watched_tcp = tcp;
+        uint32_t           sequence;
+        // A fast TCP reply may already have removed the control block. In that
+        // case, let the TCP socket report the result; never accept unmatched ICMP.
+        int watched_icmp = initial_sequence(&local, remote, &sequence) ? icmp : -1;
         for (;;) {
             double remaining_ms = start + TIMEOUT_MS - now_ms();
             if (remaining_ms < 0) {
                 break;
             }
 
-            struct pollfd fds[] = {{icmp, POLLIN, 0}, {watched_tcp, POLLOUT, 0}};
+            struct pollfd fds[] = {{watched_icmp, POLLIN, 0}, {watched_tcp, POLLOUT, 0}};
             int           ready = poll(fds, 2, (int)remaining_ms + 1);
             if (ready < 0) {
                 if (errno == EINTR) {
@@ -206,7 +263,7 @@ static reply_t wait_for_reply(int icmp, int tcp, const struct sockaddr_in *remot
             }
 
             if (fds[0].revents & POLLIN) {
-                if (receive_icmp(icmp, &local, remote, &reply)) {
+                if (receive_icmp(icmp, &local, remote, sequence, &reply)) {
                     break;
                 }
                 continue;
