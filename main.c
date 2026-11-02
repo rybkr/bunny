@@ -179,14 +179,15 @@ static reply_t wait_for_reply(int icmp, int tcp, const struct sockaddr_in *remot
         reply.port_open = (initial_error == 0);
         reply.error     = initial_error;
     } else {
-        struct sockaddr_in local = local_address(tcp);
+        struct sockaddr_in local       = local_address(tcp);
+        int                watched_tcp = tcp;
         for (;;) {
             double remaining_ms = start + TIMEOUT_MS - now_ms();
             if (remaining_ms < 0) {
                 break;
             }
 
-            struct pollfd fds[] = {{icmp, POLLIN, 0}, {tcp, POLLOUT, 0}};
+            struct pollfd fds[] = {{icmp, POLLIN, 0}, {watched_tcp, POLLOUT, 0}};
             int           ready = poll(fds, 2, (int)remaining_ms + 1);
             if (ready < 0) {
                 if (errno == EINTR) {
@@ -210,9 +211,16 @@ static reply_t wait_for_reply(int icmp, int tcp, const struct sockaddr_in *remot
                 if (getsockopt(tcp, SOL_SOCKET, SO_ERROR, &conn_error, &size) < 0) {
                     die("error: SO_ERROR: tcp socket error");
                 }
+                if (conn_error == EHOSTUNREACH) {
+                    // This could mean TTL expiry. We'll let ICMP tell us what happened.
+                    // Poll will ignore negative descriptors, hence skipping this.
+                    watched_tcp = -1;
+                    continue;
+                }
                 reply.kind      = (!conn_error || conn_error == ECONNREFUSED) ? REPLY_DESTINATION : REPLY_TCP_ERROR;
                 reply.port_open = (conn_error == 0);
                 reply.error     = conn_error;
+                break;
             }
         }
     }
