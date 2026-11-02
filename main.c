@@ -44,7 +44,7 @@ static double now_ms() {
 }
 
 static int open_icmp_listener();
-static int open_probe_socket(int ttl);
+static int open_probe_socket(int ttl, in_port_t source_port);
 static int start_conn(int tcp, const struct sockaddr_in *remote);
 
 static struct sockaddr_in local_address(int tcp);
@@ -52,7 +52,7 @@ static int                match_icmp(const unsigned char *p, size_t n, const str
 static bool               receive_icmp(int icmp, const struct sockaddr_in *local, const struct sockaddr_in *remote, reply_t *reply);
 static reply_t            wait_for_reply(int icmp, int tcp, const struct sockaddr_in *remote, double start, int initial_error);
 
-static reply_t            probe(int icmp, const struct sockaddr_in *remote, int ttl);
+static reply_t            probe(int icmp, const struct sockaddr_in *remote, int ttl, in_port_t *source_port);
 static struct sockaddr_in resolve_destination(const char *host, const char *port);
 static int                trace_route(const struct sockaddr_in *remote);
 
@@ -82,10 +82,16 @@ static int open_icmp_listener() {
     return fd;
 }
 
-static int open_probe_socket(int ttl) {
+static int open_probe_socket(int ttl, in_port_t source_port) {
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         die("error: could not open TCP socket");
+    }
+    struct sockaddr_in local = {0};
+    local.sin_family         = AF_INET;
+    local.sin_port           = source_port;
+    if (bind(fd, (const struct sockaddr *)&local, sizeof local) < 0) {
+        die("error: bind: could not bind TCP source port");
     }
     if (setsockopt(fd, IPPROTO_IP, IP_TTL, &ttl, (sizeof ttl)) < 0) {
         die("error: IP_TTL: could not set ttl for TCP socket");
@@ -229,8 +235,10 @@ static reply_t wait_for_reply(int icmp, int tcp, const struct sockaddr_in *remot
     return reply;
 }
 
-static reply_t probe(int icmp, const struct sockaddr_in *remote, int ttl) {
-    int     tcp   = open_probe_socket(ttl);
+static reply_t probe(int icmp, const struct sockaddr_in *remote, int ttl, in_port_t *source_port) {
+    int tcp      = open_probe_socket(ttl, *source_port);
+    *source_port = local_address(tcp).sin_port;
+
     double  start = now_ms();
     int     error = start_conn(tcp, remote);
     reply_t reply = wait_for_reply(icmp, tcp, remote, start, error);
@@ -258,12 +266,14 @@ static struct sockaddr_in resolve_destination(const char *host, const char *port
 }
 
 static int trace_route(const struct sockaddr_in *remote) {
-    int  icmp    = open_icmp_listener();
-    bool reached = false;
+    int       icmp        = open_icmp_listener();
+    bool      reached     = false;
+    // Let the first probe choose an ephemeral port, then reuse it for every hop.
+    in_port_t source_port = 0;
 
     for (int ttl = 1; ttl <= MAX_HOPS; ++ttl) {
         printf("%2d  ", ttl);
-        reply_t reply = probe(icmp, remote, ttl);
+        reply_t reply = probe(icmp, remote, ttl, &source_port);
         print_reply(&reply);
         if (reply.kind == REPLY_DESTINATION) {
             reached = true;
